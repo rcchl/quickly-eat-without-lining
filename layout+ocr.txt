@@ -1,0 +1,435 @@
+# encoding:utf-8
+# 新增：NumPy版本降级逻辑
+import sys
+import subprocess
+
+# 检查并降级NumPy到1.x（解决兼容性问题）
+try:
+    import numpy as np
+    if int(np.__version__.split('.')[0]) >= 2:
+        print("⚠️  检测到NumPy 2.x，可能存在兼容性问题，正在降级至1.x...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "--index-url", "https://mirrors.huaweicloud.com/repository/pypi/simple",
+            "numpy==1.26.4"
+        ])
+        print("✅ NumPy降级完成，请重启代码")
+        sys.exit(0)
+except ImportError:
+    pass  # 后续依赖检查会处理未安装的情况
+
+import requests
+import base64
+import os
+import json
+import glob
+import torch
+import numpy as np
+import math
+from PIL import Image, ImageOps, ImageDraw
+from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
+from torch.utils.data import Dataset, DataLoader
+import cv2
+
+# 1. 百度OCR凭证
+APP_ID = "120177594"
+API_KEY = "OQKBPivmg6iPvlcDECnM3msX"
+SECRET_KEY = "NFIwcoy7VNCuFcymh22hOzmZiUktBqYd"
+
+# 2. 待识别材料配置
+materials = [
+    {
+        "path": r"C:\Users\颖\Desktop\test",
+        "output": "receipt_result进账单--处理.json",
+        "layout_output": "receipt_layout_result进账单--处理.json"
+    }
+]
+
+# 3. 核心配置（强制CPU，固定路径）
+DEVICE = "cpu"
+LOCAL_MODEL_PATH_INNER = r"C:\Users\颖\Desktop\layoutlmv3-base"
+
+# 文档实体类型定义
+LABEL_LIST = [
+    "O", "B-HEADER", "I-HEADER", "B-TEXT", "I-TEXT",
+    "B-TABLE", "I-TABLE", "B-FIGURE", "I-FIGURE", "B-SIGNATURE", "I-SIGNATURE"
+]
+ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
+LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
+
+
+def get_access_token():
+    """获取百度API的access_token"""
+    url = f"https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id={API_KEY}&client_secret={SECRET_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        return result["access_token"] if "access_token" in result else None
+    except Exception as e:
+        raise Exception(f"获取access_token失败: {str(e)}")
+
+
+def auto_rotate_image(image):
+    """自动检测图片方向并旋转纠正"""
+    try:
+        gray = image.convert('L')
+        binary = gray.point(lambda p: p > 127 and 255)
+        img_array = np.array(binary)
+        edges = np.diff(img_array, axis=0).astype(np.int16)
+        edges = np.abs(edges).sum(axis=1)
+        non_zero = np.where(edges > 0)[0]
+        if len(non_zero) < 3:
+            return image
+        angles = []
+        for i in range(0, len(non_zero) - 2, 2):
+            y1, y2 = non_zero[i], non_zero[i + 1]
+            angle = math.degrees(math.atan2(y2 - y1, image.width))
+            angles.append(angle)
+        if angles:
+            angle = np.mean([a for a in angles if abs(a) < 15])
+            return image.rotate(-angle, expand=True) if abs(angle) > 0.5 else image
+    except Exception as e:
+        print(f"自动旋转图片出错: {str(e)}")
+    return image
+
+
+def auto_crop_image(image, margin=20):
+    """自动裁剪图片，去除多余空白区域"""
+    try:
+        gray = image.convert('L')
+        binary = gray.point(lambda p: p < 240 and 255)
+        img_array = np.array(binary)
+        non_zero = np.where(img_array > 0)
+        if len(non_zero[0]) == 0:
+            return image
+        min_y, max_y = np.min(non_zero[0]), np.max(non_zero[0])
+        min_x, max_x = np.min(non_zero[1]), np.max(non_zero[1])
+        min_y = max(0, min_y - margin)
+        max_y = min(image.height, max_y + margin)
+        min_x = max(0, min_x - margin)
+        max_x = min(image.width, max_x + margin)
+        return image.crop((min_x, min_y, max_x, max_y))
+    except Exception as e:
+        print(f"自动裁剪图片出错: {str(e)}")
+    return image
+
+
+def preprocess_image(image_path):
+    """图片预处理：旋转+裁剪+缩放（CPU加速）"""
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            rotated_img = auto_rotate_image(img)
+            cropped_img = auto_crop_image(rotated_img)
+            cropped_img = cropped_img.resize((800, 1000), Image.Resampling.LANCZOS)
+            temp_path = f"{os.path.splitext(image_path)[0]}_processed{os.path.splitext(image_path)[1]}"
+            cropped_img.save(temp_path)
+            return temp_path
+    except Exception as e:
+        print(f"图片预处理失败: {str(e)}")
+        return image_path
+
+
+def recognize_image_baidu(image_path, access_token):
+    """使用百度OCR识别单张图片中的文字和位置信息"""
+    request_url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate"
+    if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+        return {"error": f"图片文件无效: {image_path}"}
+    try:
+        processed_path = preprocess_image(image_path)
+        with open(processed_path, 'rb') as f:
+            img = base64.b64encode(f.read())
+        params = {"image": img, "recognize_granularity": "small"}
+        full_url = f"{request_url}?access_token={access_token}"
+        headers = {'content-type': 'application/x-www-form-urlencoded'}
+        response = requests.post(full_url, data=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        if processed_path != image_path and os.path.exists(processed_path):
+            os.remove(processed_path)
+        return response.json()
+    except Exception as e:
+        return {"error": f"OCR识别失败: {str(e)}"}
+
+
+class DocumentDataset(Dataset):
+    """文档数据集，用于LayoutLM处理（修复：保留批次维度）"""
+
+    def __init__(self, image, ocr_results, processor):
+        self.image = image
+        self.ocr_results = ocr_results
+        self.processor = processor
+        self.words = []
+        self.boxes = []
+        if "words_result" in ocr_results:
+            for word in ocr_results["words_result"]:
+                self.words.append(word["words"])
+                coords = word["location"]
+                x1, y1 = coords["left"], coords["top"]
+                x3, y3 = coords["left"] + coords["width"], coords["top"] + coords["height"]
+                self.boxes.append([x1, y1, x3, y3])
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        encoding = self.processor(
+            self.image, self.words, boxes=self.boxes,
+            truncation=True, padding="max_length", max_length=512, return_tensors="pt"
+        )
+        # 修复：删除 squeeze(0)，保留原始批次维度 [1, 512]
+        return {k: v for k, v in encoding.items()}
+
+
+def process_with_layoutlm(image_path, ocr_results, processor, model):
+    """使用LayoutLMv3处理OCR结果（终极修复：维度冗余+长度匹配）"""
+    try:
+        image = Image.open(image_path).convert("RGB")
+        dataset = DocumentDataset(image, ocr_results, processor)
+        data_loader = DataLoader(dataset, batch_size=1)
+        model.eval()
+        with torch.no_grad():
+            for batch in data_loader:
+                # 核心修复1：移除DataLoader添加的多余批次维度（[1,1,512] → [1,512]）
+                batch = {k: v.squeeze(0).to(DEVICE) for k, v in batch.items()}
+                outputs = model(** batch)
+                # 核心修复2：确保predictions为一维列表（挤压冗余维度）
+                predictions = outputs.logits.argmax(-1).squeeze().tolist()
+                # 核心修复3：统一三个列表长度，避免解包时长度不匹配
+                valid_len = min(len(dataset.words), len(dataset.boxes), len(predictions))
+                results = []
+                # 按最小长度循环，确保每个迭代只解包3个值
+                for word, box, pred in zip(
+                    dataset.words[:valid_len],  # 取前valid_len个文字
+                    dataset.boxes[:valid_len],  # 取前valid_len个边界框
+                    predictions[:valid_len]     # 取前valid_len个预测结果
+                ):
+                    results.append({
+                        "word": word,
+                        "box": box,
+                        "label": ID2LABEL[pred],
+                        "confidence": float(torch.softmax(outputs.logits[0, predictions.index(pred)], dim=0).max())
+                    })
+                return {
+                    "layout_analysis": results,
+                    "document_type": analyze_document_type(results)
+                }
+    except Exception as e:
+        print(f"LayoutLM处理失败: {str(e)}")
+        return {"error": str(e)}
+
+
+def analyze_document_type(layout_results):
+    """根据LayoutLM分析结果判断文档类型"""
+    if not layout_results:
+        return "unknown"
+    has_table = any(item["label"].startswith("TABLE") for item in layout_results)
+    has_header = any(item["label"].startswith("HEADER") for item in layout_results)
+    if has_table and has_header:
+        return "financial_report"
+    elif not has_table and has_header:
+        return "contract"
+    elif any("发票" in item["word"] or "收据" in item["word"] for item in layout_results):
+        return "receipt"
+    else:
+        return "general_document"
+
+
+def visualize_layout_results(image_path, layout_results, output_path):
+    """可视化LayoutLM的分析结果"""
+    try:
+        image = Image.open(image_path).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        color_map = {
+            "HEADER": (255, 0, 0), "TEXT": (0, 255, 0), "TABLE": (0, 0, 255),
+            "FIGURE": (255, 255, 0), "SIGNATURE": (255, 0, 255)
+        }
+        for item in layout_results:
+            label = item["label"].split("-")[-1] if "-" in item["label"] else "O"
+            if label != "O" and label in color_map:
+                box = item["box"]
+                draw.rectangle(box, outline=color_map[label], width=2)
+                draw.text((box[0], box[1] - 15), label, fill=color_map[label])
+        vis_output_path = f"{os.path.splitext(output_path)[0]}_layout_vis{os.path.splitext(output_path)[1]}"
+        image.save(vis_output_path)
+        return vis_output_path
+    except Exception as e:
+        print(f"可视化Layout结果失败: {str(e)}")
+        return None
+
+
+def check_model_file_integrity(model_path):
+    """检查模型文件完整性（含merges.txt）"""
+    file_sizes = {
+        "config.json": (800, 1000),
+        "pytorch_model.bin": (400_000_000, 550_000_000),
+        "preprocessor_config.json": (200, 500),
+        "tokenizer_config.json": (500, 2000),
+        "vocab.json": (800_000, 900_000),
+        "merges.txt": (400_000, 500_000)
+    }
+    invalid_files = []
+    for file_name, (min_size, max_size) in file_sizes.items():
+        file_path = os.path.join(model_path, file_name)
+        if not os.path.exists(file_path):
+            invalid_files.append(f"{file_name} - 不存在")
+            continue
+        file_size = os.path.getsize(file_path)
+        if not (min_size <= file_size <= max_size):
+            invalid_files.append(f"{file_name} - 大小异常（实际：{file_size}字节，预期：{min_size}-{max_size}字节）")
+    return invalid_files
+
+
+def load_local_layoutlm_model():
+    """加载本地LayoutLMv3模型（修复：禁用自动OCR）"""
+    try:
+        model_path = os.path.abspath(LOCAL_MODEL_PATH_INNER)
+        print(f"\n=== 模型加载终极调试 ===")
+        print(f"最终加载路径：{model_path}")
+
+        invalid_files = check_model_file_integrity(model_path)
+        if invalid_files:
+            raise Exception(f"模型文件无效：{', '.join(invalid_files)}")
+        print("✅ 模型文件完整性验证通过")
+
+        required_versions = {
+            "transformers": ">=4.28.0",
+            "torch": ">=2.0.0"
+        }
+        import pkg_resources
+        missing_versions = []
+        for pkg, req_ver in required_versions.items():
+            try:
+                current_ver = pkg_resources.get_distribution(pkg).version
+                if pkg == "transformers" and int(current_ver.split('.')[0]) < 4:
+                    missing_versions.append(f"{pkg}（当前：{current_ver}，需求：{req_ver}）")
+                elif pkg == "torch" and int(current_ver.split('.')[0]) < 2:
+                    missing_versions.append(f"{pkg}（当前：{current_ver}，需求：{req_ver}）")
+            except pkg_resources.DistributionNotFound:
+                missing_versions.append(f"{pkg} - 未安装")
+
+        if missing_versions:
+            print(f"⚠️  依赖库版本不兼容：{', '.join(missing_versions)}")
+            print("正在强制升级依赖库...")
+            import subprocess
+            import sys
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install",
+                "--index-url", "https://mirrors.huaweicloud.com/repository/pypi/simple",
+                "--upgrade",
+                "transformers>=4.28.0", "torch>=2.0.0"
+            ])
+            print("✅ 依赖库升级完成，重启代码生效")
+            sys.exit(0)
+
+        print("正在加载模型（CPU模式+本地文件强制加载）...")
+        processor = LayoutLMv3Processor.from_pretrained(
+            model_path,
+            local_files_only=True,
+            apply_ocr=False,  # 禁用自动OCR
+            trust_remote_code=True
+        )
+        model = LayoutLMv3ForTokenClassification.from_pretrained(
+            model_path,
+            id2label=ID2LABEL,
+            label2id=LABEL2ID,
+            torch_dtype=torch.float32,
+            local_files_only=True,
+            trust_remote_code=True
+        )
+        model.to(DEVICE)
+        print("✅ 本地LayoutLMv3模型加载成功！")
+        return processor, model
+
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        raise Exception(f"加载失败详情：{str(e)}\n{error_detail}")
+
+
+def process_images():
+    """处理指定文件夹中的所有图片"""
+    try:
+        required_libraries = [("PIL", "pillow"), ("numpy", "numpy"), ("torch", "torch"),
+                              ("transformers", "transformers"), ("cv2", "opencv-python")]
+        missing_libs = []
+        for imp_name, pkg_name in required_libraries:
+            try:
+                __import__(imp_name)
+            except ImportError:
+                missing_libs.append(pkg_name)
+
+        if missing_libs:
+            print(f"安装缺失依赖：{', '.join(missing_libs)}")
+            import subprocess
+            import sys
+            subprocess.check_call([
+                                      sys.executable, "-m", "pip", "install",
+                                      "--index-url", "https://mirrors.huaweicloud.com/repository/pypi/simple",
+                                      "--default-timeout", "100"
+                                  ] + missing_libs)
+
+        print("正在加载本地LayoutLMv3模型...")
+        processor, model = load_local_layoutlm_model()
+
+        print("\n获取百度API访问令牌...")
+        access_token = get_access_token()
+        if not access_token:
+            raise Exception("无法获取百度OCR访问令牌")
+        print("✅ 成功获取OCR令牌")
+
+        for material in materials:
+            folder_path = material["path"]
+            output_file = material["output"]
+            layout_output_file = material["layout_output"]
+
+            print(f"\n处理文件夹：{folder_path}")
+            if not os.path.isdir(folder_path):
+                print(f"错误：文件夹不存在 - {folder_path}")
+                continue
+
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif', '*.tiff']
+            image_files = sorted(
+                list(set(sum([glob.glob(os.path.join(folder_path, ext)) for ext in image_extensions], []))))
+            if not image_files:
+                print("警告：无图片文件")
+                continue
+
+            print(f"发现 {len(image_files)} 个图片文件，开始处理...")
+            ocr_results = []
+            layout_results = []
+            for i, img_path in enumerate(image_files, 1):
+                print(f"\n处理第 {i}/{len(image_files)} 个文件：{os.path.basename(img_path)}")
+                ocr_result = recognize_image_baidu(img_path, access_token)
+                layout_result = process_with_layoutlm(img_path, ocr_result, processor, model)
+
+                if "layout_analysis" in layout_result:
+                    vis_path = visualize_layout_results(img_path, layout_result["layout_analysis"], img_path)
+                    if vis_path:
+                        print(f"  可视化保存至：{vis_path}")
+
+                ocr_results.append(
+                    {"image_path": img_path, "file_name": os.path.basename(img_path), "ocr_result": ocr_result,
+                     "processing_time": str(os.path.getmtime(img_path))})
+                layout_results.append(
+                    {"image_path": img_path, "file_name": os.path.basename(img_path), "ocr_result": ocr_result,
+                     "layout_result": layout_result, "processing_time": str(os.path.getmtime(img_path))})
+
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(ocr_results, f, ensure_ascii=False, indent=4)
+            print(f"\nOCR结果保存至：{os.path.abspath(output_file)}")
+
+            with open(layout_output_file, 'w', encoding='utf-8') as f:
+                json.dump(layout_results, f, ensure_ascii=False, indent=4)
+            print(f"Layout结果保存至：{os.path.abspath(layout_output_file)}")
+
+    except Exception as e:
+        print(f"\n❌ 处理错误：{str(e)}")
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("百度OCR + LayoutLMv3 文档识别系统（终极修复版）")
+    print("=" * 50)
+    process_images()
+    print("\n🎉 程序执行完毕！")
